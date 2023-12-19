@@ -19,7 +19,7 @@ class CLIPGPT2Classification(nn.Module):
 
         # prepare CLIP encoders (visual and text)
         config = CLIPConfig.from_pretrained("openai/clip-vit-base-patch32", projection_dim=768)
-        model = CLIPModel(config)
+        model = CLIPModel(config).to(device)
 
         self.config = model.config  # 获取模型的配置信息, output_attentions, output_hidden_states
         self.text_model = model.text_model  # 获取文本编码模型
@@ -76,7 +76,7 @@ class CLIPGPT2Classification(nn.Module):
         )
 
         # get visual and text embeddings
-        image_embeds = vision_outputs[0]  # why vision_outputs[1] but vision_outputs[0]?
+        image_embeds = vision_outputs[0].to(device)
         # print(vision_outputs[0].shape)  # torch.Size([1, 50, 768]) = [batch_size, sequence_length, hidden_size]
         # the last hidden state of the vision model;
         # the final layer's output for each patch of the image, including the [CLS] token. 50 = 49 patches + 1 [CLS]
@@ -88,7 +88,7 @@ class CLIPGPT2Classification(nn.Module):
         image_embeds = self.visual_projection(image_embeds)  # 对图像嵌入进行投影处理
         # print('image_embeds: ', image_embeds.shape)
         # torch.Size([1, 512]) --> torch.Size([1, 768]) --> torch.Size([1, 50, 768])
-        text_embeds = text_outputs[0]
+        text_embeds = text_outputs[0].to(device)
         # print(text_outputs[0].shape)  # torch.Size([1, 7, 512])
         # print(text_outputs[1].shape)  # torch.Size([1, 512])
         text_embeds = self.text_projection(text_embeds)
@@ -100,20 +100,54 @@ class CLIPGPT2Classification(nn.Module):
         text_seq_len = text_embeds.shape[1]  # 7
 
         # get text and visual attention mask
-        text_attention_mask = attention_mask
+        text_attention_mask = attention_mask.to(device)
         # print(text_attention_mask.shape)  # torch.Size([1, 7])
-        visual_attention_mask = torch.ones((batch_size, visual_seq_len), dtype=torch.float)
+        visual_attention_mask = torch.ones((batch_size, visual_seq_len), dtype=torch.float).to(device)
         # print(visual_attention_mask.shape)  # torch.Size([1, 50])
-        inputs_attention_mask = torch.cat((text_attention_mask, visual_attention_mask), dim=1)
-        # print(inputs_attention_mask.shape)  # torch.Size([1, 57])
+
+        # get visual id_type and position_id
+        if self.vis_pos_emb == 'zeroes':
+            visual_token_type_id = torch.ones(*image_embeds.size()[:-1], dtype=torch.long, device=device)
+            visual_position_id = torch.zeros(*image_embeds.size()[:-1], dtype=torch.long, device=device)
+            # print(visual_token_type_id.shape)  # torch.Size([1, 50])
+            # print(visual_position_id.shape)  # torch.Size([1, 50])
+        elif self.vis_pos_emb == 'pos':
+            visual_token_type_id = torch.ones(*image_embeds.size()[:-1], dtype=torch.long, device=device)
+            visual_position_id = torch.arange(0, image_embeds.size()[1])
+            visual_position_id = torch.unsqueeze(visual_position_id, 0)
+            visual_position_id = visual_position_id.repeat(image_embeds.size()[0], 1)
+            visual_position_id = visual_position_id.to(device)
+
+        # get text id_type and position_id
+        if self.vis_pos_emb == 'zeroes' or self.vis_pos_emb == 'pos':
+            text_token_type_id = torch.zeros(*text_embeds.size()[:-1], dtype=torch.long, device=device)
+            text_position_id = torch.arange(0, text_embeds.size()[1])
+            text_position_id = torch.unsqueeze(text_position_id, 0)
+            text_position_id = text_position_id.repeat(text_embeds.size()[0], 1)  # 为整个batch创建position id
+            text_position_id = text_position_id.to(device)
+            # print(text_token_type_id.shape)  # torch.Size([1, 7])
+            # print(text_position_id.shape)  # torch.Size([1, 7])
 
         # concatenate text and visual embeddings (text first)
-        inputs_embeds = torch.cat((text_embeds, image_embeds), dim=1)
+        inputs_embeds = torch.cat((text_embeds, image_embeds), dim=1).to(device)
         # print(inputs_embeds.shape)  # torch.Size([1, 57, 768])
         # in surgicalGPT, # torch.Size([40, 25, 768]) + torch.Size([40, 49, 768]) = torch.Size([40, 74, 768])
+        # concatenate text and visual attention mask (text first)
+        inputs_attention_mask = torch.cat((text_attention_mask, visual_attention_mask), dim=1).to(device)
+        # print(inputs_attention_mask.shape)  # torch.Size([1, 57])
+
+        if self.vis_pos_emb == 'zeroes' or self.vis_pos_emb == 'pos':
+            inputs_token_type_id = torch.cat((text_token_type_id, visual_token_type_id), dim=1).to(device)
+            # print(inputs_token_type_id.shape)  # torch.Size([1, 57])
+            inputs_position_id = torch.cat((text_position_id, visual_position_id), dim=1).to(device)
+            # print(inputs_position_id.shape)  # torch.Size([1, 57])
 
         # decode
-        decoder_output = self.VCA_decoder(inputs_embeds=inputs_embeds, attention_mask=inputs_attention_mask)
+        if self.vis_pos_emb == 'zeroes' or self.vis_pos_emb == 'pos':
+            decoder_output = self.VCA_decoder(inputs_embeds=inputs_embeds, attention_mask=inputs_attention_mask,
+                                              position_ids=inputs_position_id, token_type_ids=inputs_token_type_id)
+        else:
+            decoder_output = self.VCA_decoder(inputs_embeds=inputs_embeds, attention_mask=inputs_attention_mask)
 
         decoder_output = decoder_output.last_hidden_state.swapaxes(1, 2)
         decoder_output = F.adaptive_avg_pool1d(decoder_output, 1)
@@ -129,14 +163,14 @@ class CLIPGPT2Classification(nn.Module):
         return out
 
 
-model = CLIPGPT2Classification()
+model = CLIPGPT2Classification(vis_pos_emb='zeroes').to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # url = "http://images.cocodataset.org/val2017/000000039769.jpg"
 # image = Image.open(requests.get(url, stream=True).raw)
 image = Image.open('./cat.jpg')
 
-inputs = processor(text=[" a photo of a cat"], images=image, return_tensors="pt", padding=True)
+inputs = processor(text=[" a photo of a cat"], images=image, return_tensors="pt", padding=True).to(device)
 # print(inputs['input_ids'].shape)  # torch.Size([1, 7])
 # print(inputs['pixel_values'].shape)  # torch.Size([1, 3, 224, 224])
 # print(inputs['attention_mask'].shape)  # torch.Size([1, 7])
